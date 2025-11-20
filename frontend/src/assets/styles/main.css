@@ -1,0 +1,93 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 自定义样式 */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  min-height: 100vh;
+}
+
+#app {
+  min-height: 100vh;
+}
+
+/* 风险等级颜色 */
+.risk-low {
+  @apply text-success bg-success/10 border-success/30;
+}
+
+.risk-medium {
+  @apply text-warning bg-warning/10 border-warning/30;
+}
+
+.risk-high {
+  @apply text-orange-500 bg-orange-500/10 border-orange-500/30;
+}
+
+.risk-critical {
+  @apply text-danger bg-danger/10 border-danger/30;
+}
+
+/* 加载动画 */
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.animate-spin {
+  animation: spin 1s linear infinite;
+}
+
+/* 渐入动画 */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.fade-in {
+  animation: fadeIn 0.5s ease-out;
+}
+
+/* 卡片样式 */
+.card {
+  @apply bg-white rounded-2xl shadow-lg p-6;
+}
+
+/* 按钮样式 */
+.btn {
+  @apply px-6 py-3 rounded-lg font-semibold transition-all duration-200;
+}
+
+.btn-primary {
+  @apply bg-primary text-white hover:bg-primary-dark;
+}
+
+.btn-secondary {
+  @apply bg-gray-200 text-gray-700 hover:bg-gray-300;
+}
+
+/* 响应式 */
+@media (max-width: 768px) {
+  .card {
+    @apply p-4;
+  }
+}
