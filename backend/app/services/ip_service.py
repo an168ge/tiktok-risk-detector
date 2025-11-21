@@ -1,346 +1,306 @@
 """
-IP检测服务
+检测API端点
 """
-import httpx
+from fastapi import APIRouter, Depends, Request, HTTPException, BackgroundTasks
+from typing import Dict, Any
 import logging
-from typing import Optional, Dict, Any
+
 from app.schemas import (
-    IPInfo, IPQuality, IPDetectionResult, IPType, RiskLevel
+    DetectionRequest, DetectionReport, APIResponse, RiskLevel
 )
-from app.config import settings
+from app.services.ip_service import ip_detection_service
+from app.services.fingerprint_service import fingerprint_service
+from app.services.dns_service import dns_detection_service
+from app.services.webrtc_service import webrtc_detection_service
+from app.services.device_service import device_detection_service
+from app.services.network_service import network_detection_service
+from app.services.risk_scoring_service import risk_scoring_service
+from app.core.rate_limit import check_rate_limit
 from app.core.cache import redis_client
+from app.core.api_rate_manager import api_rate_manager
 
 logger = logging.getLogger(__name__)
 
+router = APIRouter()
 
-class IPDetectionService:
-    """IP检测服务"""
-    
-    def __init__(self):
-        self.timeout = httpx.Timeout(10.0)
-        self.cache_ttl = 3600  # IP检测结果缓存1小时
-    
-    async def detect_full(self, ip: str) -> IPDetectionResult:
-        """完整IP检测"""
-        # 检查缓存
-        cache_key = redis_client.make_key("ip_detection", ip)
-        cached_result = await redis_client.get(cache_key)
-        if cached_result:
-            logger.info(f"IP detection cache hit: {ip}")
-            return IPDetectionResult(**cached_result)
-        
-        # 执行检测
-        info = await self.get_ip_info(ip)
-        quality = await self.check_ip_quality(ip)
-        
-        # 计算风险分数
-        risk_score = self._calculate_risk_score(quality)
-        risk_level = self._get_risk_level(risk_score)
-        
-        # 生成问题和建议
-        issues = self._identify_issues(quality)
-        recommendations = self._generate_recommendations(issues)
-        
-        result = IPDetectionResult(
-            info=info,
-            quality=quality,
-            risk_score=risk_score,
-            risk_level=risk_level,
-            issues=issues,
-            recommendations=recommendations
+
+@router.post("/start", response_model=APIResponse, dependencies=[Depends(check_rate_limit)])
+async def start_detection(
+        request: Request,
+        detection_req: DetectionRequest,
+        background_tasks: BackgroundTasks
+) -> APIResponse:
+    """
+    开始完整检测
+
+    这是主要的检测端点，会执行所有检测项并返回完整报告
+    """
+    try:
+        # 获取客户端IP
+        client_ip = request.client.host
+
+        # 如果有X-Forwarded-For头（反向代理），使用其中的IP
+        forwarded_for = request.headers.get("X-Forwarded-For")
+        if forwarded_for:
+            client_ip = forwarded_for.split(",")[0].strip()
+
+        logger.info(f"Starting detection for IP: {client_ip}")
+
+        # 准备检测数据
+        detection_data = detection_req.model_dump()
+        detection_data["client_ip"] = client_ip
+
+        # 1. IP检测
+        ip_result = await ip_detection_service.detect_full(client_ip)
+        logger.info(f"IP detection completed: {ip_result.risk_level}")
+
+        # 将IP国家信息添加到检测数据中，用于后续一致性分析
+        if ip_result.info.country_code:
+            detection_data["ip_country_code"] = ip_result.info.country_code
+
+        # 2. 指纹检测
+        fingerprint_result = await fingerprint_service.analyze_fingerprint(detection_data)
+        logger.info(f"Fingerprint detection completed: {fingerprint_result.risk_level}")
+
+        # 3. DNS检测
+        dns_result = None
+        if detection_req.dns_servers:
+            dns_result = await dns_detection_service.detect_full(
+                dns_servers=detection_req.dns_servers,
+                expected_country=ip_result.info.country_code,
+                vpn_ip=client_ip
+            )
+            logger.info(f"DNS detection completed: {dns_result.risk_level}")
+
+        # 4. WebRTC检测
+        webrtc_result = None
+        if detection_req.webrtc_ips:
+            webrtc_result = await webrtc_detection_service.detect_full(
+                webrtc_ips=detection_req.webrtc_ips,
+                vpn_ip=client_ip,
+                real_ip=None  # 可以从其他来源获取真实IP
+            )
+            logger.info(f"WebRTC detection completed: {webrtc_result.risk_level}")
+
+        # 5. 设备检测
+        device_result = await device_detection_service.detect_full(
+            user_agent=detection_data["user_agent"],
+            platform=detection_data["platform"],
+            data=detection_data
         )
-        
-        # 缓存结果
-        await redis_client.set(
-            cache_key,
-            result.model_dump(),
-            ttl=self.cache_ttl
+        logger.info(f"Device detection completed: {device_result.risk_level}")
+
+        # 6. 网络质量检测
+        network_result = await network_detection_service.detect_full()
+        logger.info(f"Network detection completed: {network_result.risk_level}")
+
+        # 生成综合报告
+        report = await risk_scoring_service.generate_report(
+            ip_result=ip_result,
+            dns_result=dns_result,
+            webrtc_result=webrtc_result,
+            fingerprint_result=fingerprint_result,
+            device_result=device_result,
+            network_result=network_result
         )
-        
-        return result
-    
-    async def get_ip_info(self, ip: str) -> IPInfo:
-        """获取IP基础信息"""
-        try:
-            # 使用ip-api.com免费API（无需密钥）
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.get(
-                    f"http://ip-api.com/json/{ip}",
-                    params={
-                        "fields": "status,message,country,countryCode,region,city,"
-                                "lat,lon,isp,as,asname,query"
-                    }
-                )
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    
-                    if data.get("status") == "success":
-                        return IPInfo(
-                            ip=data.get("query", ip),
-                            country=data.get("country"),
-                            country_code=data.get("countryCode"),
-                            region=data.get("region"),
-                            city=data.get("city"),
-                            latitude=data.get("lat"),
-                            longitude=data.get("lon"),
-                            isp=data.get("isp"),
-                            asn=data.get("as"),
-                            as_name=data.get("asname")
-                        )
-        
-        except Exception as e:
-            logger.error(f"Failed to get IP info: {e}")
-        
-        # 返回默认值
-        return IPInfo(ip=ip)
-    
-    async def check_ip_quality(self, ip: str) -> IPQuality:
-        """检测IP质量"""
-        # 尝试使用多个API进行检测
-        
-        # 方案1: 使用IPHub API（如果配置了）
-        if settings.IPHUB_API_KEY:
-            result = await self._check_with_iphub(ip)
-            if result:
-                return result
-        
-        # 方案2: 使用IPQualityScore API（如果配置了）
-        if settings.IPQUALITYSCORE_API_KEY:
-            result = await self._check_with_ipqualityscore(ip)
-            if result:
-                return result
-        
-        # 方案3: 使用免费的ipqs.io API
-        result = await self._check_with_ipqs_free(ip)
-        if result:
-            return result
-        
-        # 默认返回（假设是住宅IP，无风险）
-        return IPQuality(
-            ip_type=IPType.RESIDENTIAL,
-            is_vpn=False,
-            is_proxy=False,
-            is_datacenter=False,
-            is_tor=False,
-            is_hosting=False,
-            reputation_score=80.0,
-            fraud_score=20.0
+
+        # 异步保存到数据库（可选）
+        # background_tasks.add_task(save_detection_record, report)
+
+        # 缓存报告（1小时）
+        cache_key = redis_client.make_key("detection_report", report.detection_id)
+        await redis_client.set(cache_key, report.model_dump(), ttl=3600)
+
+        logger.info(
+            f"Detection completed: ID={report.detection_id}, "
+            f"Score={report.overall_score}, Level={report.overall_risk_level}"
         )
-    
-    async def _check_with_iphub(self, ip: str) -> Optional[IPQuality]:
-        """使用IPHub API检测"""
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.get(
-                    f"https://v2.api.iphub.info/ip/{ip}",
-                    headers={"X-Key": settings.IPHUB_API_KEY}
-                )
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    block = data.get("block", 0)
-                    
-                    # IPHub的block字段: 0=住宅, 1=VPN/代理, 2=数据中心
-                    is_vpn = block == 1
-                    is_datacenter = block == 2
-                    ip_type = IPType.RESIDENTIAL if block == 0 else (
-                        IPType.VPN if is_vpn else IPType.DATACENTER
-                    )
-                    
-                    return IPQuality(
-                        ip_type=ip_type,
-                        is_vpn=is_vpn,
-                        is_proxy=is_vpn,
-                        is_datacenter=is_datacenter,
-                        reputation_score=100 - (block * 40),
-                        fraud_score=block * 40
-                    )
-        
-        except Exception as e:
-            logger.error(f"IPHub API error: {e}")
-        
-        return None
-    
-    async def _check_with_ipqualityscore(self, ip: str) -> Optional[IPQuality]:
-        """使用IPQualityScore API检测"""
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.get(
-                    f"https://ipqualityscore.com/api/json/ip/{settings.IPQUALITYSCORE_API_KEY}/{ip}",
-                    params={"strictness": 1}
-                )
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    
-                    if data.get("success"):
-                        is_vpn = data.get("vpn", False)
-                        is_proxy = data.get("proxy", False)
-                        is_tor = data.get("tor", False)
-                        fraud_score = data.get("fraud_score", 0)
-                        
-                        # 判断IP类型
-                        if is_vpn:
-                            ip_type = IPType.VPN
-                        elif is_proxy:
-                            ip_type = IPType.PROXY
-                        elif is_tor:
-                            ip_type = IPType.PROXY
-                        else:
-                            ip_type = IPType.RESIDENTIAL
-                        
-                        return IPQuality(
-                            ip_type=ip_type,
-                            is_vpn=is_vpn,
-                            is_proxy=is_proxy,
-                            is_datacenter=data.get("is_crawler", False),
-                            is_tor=is_tor,
-                            reputation_score=100 - fraud_score,
-                            fraud_score=fraud_score,
-                            abuse_confidence_score=data.get("abuse_velocity", 0)
-                        )
-        
-        except Exception as e:
-            logger.error(f"IPQualityScore API error: {e}")
-        
-        return None
-    
-    async def _check_with_ipqs_free(self, ip: str) -> Optional[IPQuality]:
-        """使用免费的proxycheck.io API"""
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.get(
-                    f"https://proxycheck.io/v2/{ip}",
-                    params={"vpn": 1, "asn": 1}
-                )
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    ip_data = data.get(ip, {})
-                    
-                    if ip_data:
-                        is_proxy = ip_data.get("proxy", "no") == "yes"
-                        proxy_type = ip_data.get("type", "").lower()
-                        
-                        is_vpn = "vpn" in proxy_type
-                        is_datacenter = "hosting" in proxy_type or "datacenter" in proxy_type
-                        
-                        if is_vpn:
-                            ip_type = IPType.VPN
-                        elif is_proxy:
-                            ip_type = IPType.PROXY
-                        elif is_datacenter:
-                            ip_type = IPType.DATACENTER
-                        else:
-                            ip_type = IPType.RESIDENTIAL
-                        
-                        fraud_score = 50.0 if is_proxy else 10.0
-                        
-                        return IPQuality(
-                            ip_type=ip_type,
-                            is_vpn=is_vpn,
-                            is_proxy=is_proxy,
-                            is_datacenter=is_datacenter,
-                            reputation_score=100 - fraud_score,
-                            fraud_score=fraud_score
-                        )
-        
-        except Exception as e:
-            logger.error(f"Proxycheck.io API error: {e}")
-        
-        return None
-    
-    def _calculate_risk_score(self, quality: IPQuality) -> float:
-        """计算IP风险分数（0-100，越高越好）"""
-        score = 100.0
-        
-        # VPN扣分
-        if quality.is_vpn:
-            score -= 30
-        
-        # 代理扣分
-        if quality.is_proxy:
-            score -= 25
-        
-        # 数据中心扣分
-        if quality.is_datacenter:
-            score -= 20
-        
-        # Tor扣分
-        if quality.is_tor:
-            score -= 40
-        
-        # 托管IP扣分
-        if quality.is_hosting:
-            score -= 15
-        
-        # 基于信誉分数调整
-        reputation_factor = quality.reputation_score / 100
-        score = score * 0.7 + quality.reputation_score * 0.3
-        
-        return max(0, min(100, score))
-    
-    def _get_risk_level(self, score: float) -> RiskLevel:
-        """根据分数获取风险等级"""
-        if score >= 80:
-            return RiskLevel.LOW
-        elif score >= 60:
-            return RiskLevel.MEDIUM
-        elif score >= 40:
-            return RiskLevel.HIGH
+
+        return APIResponse(
+            success=True,
+            message="Detection completed successfully",
+            data=report.model_dump()
+        )
+
+    except Exception as e:
+        logger.error(f"Detection error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Detection failed: {str(e)}")
+
+
+@router.get("/{detection_id}", response_model=APIResponse)
+async def get_detection_result(detection_id: str) -> APIResponse:
+    """
+    获取检测结果
+
+    根据检测ID获取之前的检测报告
+    """
+    try:
+        # 从缓存获取
+        cache_key = redis_client.make_key("detection_report", detection_id)
+        cached_report = await redis_client.get(cache_key)
+
+        if cached_report:
+            return APIResponse(
+                success=True,
+                data=cached_report
+            )
+
+        # 从数据库获取（如果有）
+        # report = await get_report_from_db(detection_id)
+        # if report:
+        #     return APIResponse(success=True, data=report)
+
+        raise HTTPException(status_code=404, detail="Detection result not found")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get detection result error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/ip", response_model=APIResponse, dependencies=[Depends(check_rate_limit)])
+async def detect_ip(request: Request) -> APIResponse:
+    """
+    单独IP检测
+
+    只执行IP检测，返回IP相关信息和风险评估
+    """
+    try:
+        client_ip = request.client.host
+        forwarded_for = request.headers.get("X-Forwarded-For")
+        if forwarded_for:
+            client_ip = forwarded_for.split(",")[0].strip()
+
+        result = await ip_detection_service.detect_full(client_ip)
+
+        return APIResponse(
+            success=True,
+            message="IP detection completed",
+            data=result.model_dump()
+        )
+
+    except Exception as e:
+        logger.error(f"IP detection error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/fingerprint", response_model=APIResponse, dependencies=[Depends(check_rate_limit)])
+async def detect_fingerprint(
+        request: Request,
+        detection_req: DetectionRequest
+) -> APIResponse:
+    """
+    单独指纹检测
+
+    只执行浏览器指纹检测和一致性分析
+    """
+    try:
+        detection_data = detection_req.model_dump()
+        result = await fingerprint_service.analyze_fingerprint(detection_data)
+
+        return APIResponse(
+            success=True,
+            message="Fingerprint detection completed",
+            data=result.model_dump()
+        )
+
+    except Exception as e:
+        logger.error(f"Fingerprint detection error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/quick-check", response_model=APIResponse)
+async def quick_check(request: Request) -> APIResponse:
+    """
+    快速检查
+
+    返回基本的IP信息和风险等级，用于首页快速展示
+    """
+    try:
+        client_ip = request.client.host
+        forwarded_for = request.headers.get("X-Forwarded-For")
+        if forwarded_for:
+            client_ip = forwarded_for.split(",")[0].strip()
+
+        # 只获取IP基础信息和质量评估
+        info = await ip_detection_service.get_ip_info(client_ip)
+        quality = await ip_detection_service.check_ip_quality(client_ip)
+
+        # 简单的风险评估
+        risk_score = ip_detection_service._calculate_risk_score(quality)
+
+        if risk_score >= 80:
+            risk_level = "low"
+            message = "环境良好"
+        elif risk_score >= 60:
+            risk_level = "medium"
+            message = "存在中等风险"
+        elif risk_score >= 40:
+            risk_level = "high"
+            message = "存在较高风险"
         else:
-            return RiskLevel.CRITICAL
-    
-    def _identify_issues(self, quality: IPQuality) -> list[str]:
-        """识别问题"""
-        issues = []
-        
-        if quality.is_vpn:
-            issues.append("检测到VPN连接，可能被TikTok识别")
-        
-        if quality.is_proxy:
-            issues.append("检测到代理服务器，风险较高")
-        
-        if quality.is_datacenter:
-            issues.append("IP来自数据中心，不是住宅IP")
-        
-        if quality.is_tor:
-            issues.append("检测到Tor网络，极高风险")
-        
-        if quality.fraud_score > 50:
-            issues.append(f"IP欺诈分数较高 ({quality.fraud_score:.1f}/100)")
-        
-        if quality.reputation_score < 50:
-            issues.append(f"IP信誉分数较低 ({quality.reputation_score:.1f}/100)")
-        
-        return issues
-    
-    def _generate_recommendations(self, issues: list[str]) -> list[str]:
-        """生成修复建议"""
-        recommendations = []
-        
-        for issue in issues:
-            if "VPN" in issue:
-                recommendations.append("建议更换为住宅IP的VPN提供商")
-            
-            if "代理" in issue:
-                recommendations.append("避免使用免费或公共代理服务")
-            
-            if "数据中心" in issue:
-                recommendations.append("使用住宅IP或4G/5G移动网络")
-            
-            if "Tor" in issue:
-                recommendations.append("不建议使用Tor访问TikTok")
-            
-            if "欺诈分数" in issue or "信誉" in issue:
-                recommendations.append("更换IP地址或VPN节点")
-        
-        if not recommendations:
-            recommendations.append("当前IP质量良好，继续保持")
-        
-        return recommendations
+            risk_level = "critical"
+            message = "存在严重风险"
+
+        return APIResponse(
+            success=True,
+            message=message,
+            data={
+                "ip": info.ip,
+                "location": f"{info.country or 'Unknown'}, {info.city or 'Unknown'}",
+                "isp": info.isp,
+                "ip_type": quality.ip_type.value,
+                "is_vpn": quality.is_vpn,
+                "is_proxy": quality.is_proxy,
+                "risk_score": round(risk_score, 1),
+                "risk_level": risk_level
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Quick check error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-# 全局服务实例
-ip_detection_service = IPDetectionService()
+@router.get("/api-stats", response_model=APIResponse)
+async def get_api_stats() -> APIResponse:
+    """
+    获取API使用统计
+
+    返回所有第三方API的使用情况，包括每日和每月配额
+    """
+    try:
+        stats = await api_rate_manager.get_usage_stats()
+
+        # 计算总体使用情况
+        total_daily_usage = sum(
+            api_stats["daily_usage"]
+            for api_stats in stats.values()
+        )
+
+        # 获取推荐的下一个API
+        next_api = await api_rate_manager.select_best_api()
+
+        return APIResponse(
+            success=True,
+            message="API statistics retrieved successfully",
+            data={
+                "api_providers": stats,
+                "total_daily_usage": total_daily_usage,
+                "next_recommended_api": next_api,
+                "rate_limit_strategy": {
+                    "description": "智能API速率限制策略",
+                    "steps": [
+                        "1. 每天前990次使用IPHub（每天1000次配额，留10次余量）",
+                        "2. 接下来150次使用IPQualityScore（每月5000次配额）",
+                        "3. 超过1140次后继续使用IPHub剩余配额",
+                        "4. 所有付费API用完后降级到免费的Proxycheck.io"
+                    ]
+                }
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Get API stats error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
